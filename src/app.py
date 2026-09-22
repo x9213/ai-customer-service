@@ -3,7 +3,7 @@ from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 
@@ -28,28 +28,39 @@ def init_rag_chain():
     # 向量化
     embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=API_KEY, base_url=BASE_URL)
     vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
     
-    # 提示词（已加上引用来源指令）
-    system_prompt = """你是一个客服助手。请严格根据以下参考材料回答用户问题。
-如果参考材料中没有相关信息，请直接回答：“抱歉，我暂时无法确认。我可以帮您转接人工客服，请稍等。”
+    # 提示词（加入了 history 占位符，让AI记住历史）
+    system_prompt = """你是一个客服助手。请根据以下参考材料回答用户问题。
+如果参考材料中有部分相关，请基于已有信息给出合理的建议或解答。
+如果完全没有相关信息，请直接回答：“抱歉，我暂时无法确认。我可以帮您转接人工客服，请稍等。”
 回答后，必须在最后另起一行，写上：“📚 来源：”加上参考材料中的来源文件名。
 
 参考材料：
 {context}
 """
-    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{question}")])
+    # 这里的 MessagesPlaceholder 就是“记忆插槽”
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}"),
+    ])
     
     # 模型
     llm = ChatOpenAI(model=CHAT_MODEL, api_key=API_KEY, base_url=BASE_URL, temperature=0.1)
     
-    # 组装链条（已加上带来源的格式化函数）
+    # 组装链条（包含带来源的格式化函数）
     def format_docs(docs):
         return "\n\n".join(f"【来源：{doc.metadata.get('source', '未知文档')}】\n{doc.page_content}" for doc in docs)
         
+    # 使用 RunnablePassthrough.assign 来同时处理 context 和 chat_history
     return (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt | llm | StrOutputParser()
+        RunnablePassthrough.assign(
+            context=(lambda x: x["question"]) | retriever | format_docs,
+        )
+        | prompt
+        | llm
+        | StrOutputParser()
     )
 
 # ==========================================
@@ -70,9 +81,20 @@ if prompt := st.chat_input("请输入您的问题..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     st.chat_message("user").write(prompt)
     
+    # 整理历史记录给 LangChain 用
+    chat_history = []
+    # 跳过第一条问候语，且不包含刚刚加入的当前问题
+    for msg in st.session_state.messages[1:-1]:
+        role = "human" if msg["role"] == "user" else "ai"
+        chat_history.append((role, msg["content"]))
+    
     with st.spinner("客服正在查询知识库..."):
         rag_chain = init_rag_chain()
-        answer = rag_chain.invoke(prompt)
+        # 把问题和历史记录一起传给链条
+        answer = rag_chain.invoke({
+            "question": prompt,
+            "chat_history": chat_history
+        })
         
     st.session_state.messages.append({"role": "assistant", "content": answer})
     st.chat_message("assistant").write(answer)
